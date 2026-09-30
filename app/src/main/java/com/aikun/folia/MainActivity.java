@@ -11,6 +11,9 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
@@ -47,6 +50,10 @@ public class MainActivity extends Activity {
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private ValueCallback<Uri[]> fileUploadCallback;
+    // 沉浸式全屏：由网页端设置开关驱动（网页端默认开启），onWindowFocusChanged 时重放。
+    private boolean immersiveEnabled = false;
+    // ③ audio/* 唤起：待消费的音频文件 Uri（onCreate 冷启动 / onNewIntent 热启动写入，桥一次性取走）。
+    private Uri pendingAudioUri = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -57,7 +64,21 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(rootLayout);
 
+        // 冷启动：从启动 intent 提取待播放音频；进程恢复（savedInstanceState != null）时不重复导入。
+        if (savedInstanceState == null) {
+            pendingAudioUri = extractAudioUri(getIntent());
+        }
+
         setupWebView();
+        // ④ 后台播放：前台服务（MediaSession/通知动作/音频焦点/耳机拔出）→ 网页播放器的命令回传通道。
+        PlaybackService.setCommandSink(command -> runOnUiThread(() -> {
+            if (webView == null) {
+                return;
+            }
+            webView.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('folia-android-media-command',{detail:'"
+                            + command + "'}));", null);
+        }));
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
         }
@@ -90,6 +111,8 @@ public class MainActivity extends Activity {
         webView.setWebChromeClient(chromeClient);
         webView.setWebViewClient(new FoliaClient());
         webView.setDownloadListener(new DL());
+        // window.foliaAndroid：原生桥（版本信息 / APK 更新下载安装 / 后续沉浸式、音频唤起、后台播放）
+        webView.addJavascriptInterface(new FoliaAndroidBridge(this), "foliaAndroid");
     }
 
     private class FoliaClient extends WebViewClient {
@@ -178,6 +201,10 @@ public class MainActivity extends Activity {
             customView = null;
             webView.setVisibility(View.VISIBLE);
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            // 全屏视频退出后恢复沉浸式（若开关开启）
+            if (immersiveEnabled) {
+                applyImmersiveMode();
+            }
             if (customViewCallback != null) {
                 customViewCallback.onCustomViewHidden();
                 customViewCallback = null;
@@ -231,6 +258,81 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        // 热启动（singleTask 复用实例）：记录新 Uri 后通知页面重新消费；页面加载完成前到达也安全，
+        // 挂载钩子会兜底消费一次。
+        pendingAudioUri = extractAudioUri(intent);
+        if (pendingAudioUri != null && webView != null) {
+            webView.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('folia-android-audio-intent'));", null);
+        }
+    }
+
+    /** 仅接受 ACTION_VIEW 且带 data 的音频唤起 intent。 */
+    private static Uri extractAudioUri(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction()) || intent.getData() == null) {
+            return null;
+        }
+        return intent.getData();
+    }
+
+    /** 网页端桥入口：取走待消费的音频 Uri（一次性）。 */
+    public Uri consumePendingAudioUri() {
+        Uri uri = pendingAudioUri;
+        pendingAudioUri = null;
+        return uri;
+    }
+
+    /** 网页端桥入口：开关沉浸式全屏（bridge 线程调用，切到 UI 线程执行）。 */
+    public void setImmersiveMode(boolean enabled) {
+        if (immersiveEnabled == enabled) {
+            return;
+        }
+        immersiveEnabled = enabled;
+        runOnUiThread(this::applyImmersiveMode);
+    }
+
+    private void applyImmersiveMode() {
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller == null) {
+                return;
+            }
+            window.setDecorFitsSystemWindows(!immersiveEnabled);
+            if (immersiveEnabled) {
+                controller.hide(WindowInsets.Type.systemBars());
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            } else {
+                controller.show(WindowInsets.Type.systemBars());
+            }
+            return;
+        }
+        View decor = window.getDecorView();
+        if (immersiveEnabled) {
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        } else {
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // 软键盘、系统对话框等会清掉 systemUiVisibility；重新聚焦时补放一次。
+        if (hasFocus && immersiveEnabled) {
+            applyImmersiveMode();
+        }
+    }
+
+    @Override
     public void onBackPressed() {
         if (customView != null) {
             chromeClient.onHideCustomView();
@@ -268,6 +370,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        PlaybackService.setCommandSink(null);
         if (webView != null) {
             webView.loadUrl("about:blank");
             rootLayout.removeView(webView);
