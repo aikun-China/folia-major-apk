@@ -3,7 +3,7 @@
 Folia 的 Android WebView 混合壳客户端，加载 [Folia Web](https://music.aikun-bili.top)。
 
 - 网页端源码（二次开发）：[aikun-China/folia-major-web](https://github.com/aikun-China/folia-major-web)
-- 上游项目：[chthollyphile/folia-major](https://github.com/chthollyphile/folia-major)
+- 修改出处（上游项目）：[chthollyphile/folia-major](https://github.com/chthollyphile/folia-major)，本仓库仅在其网页端基础上提供安卓壳封装
 
 ## 特性
 

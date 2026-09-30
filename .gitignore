@@ -15,5 +15,6 @@ local.properties
 Thumbs.db
 .DS_Store
 
-# 本地改动记录（用户规则：不提交 GitHub）
+# 本地工作文件（用户规则：不提交 GitHub）
 CHANGELOG.MD
+AGENTS.md
