@@ -1,0 +1,19 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# 签名文件（禁止入库）
+*.jks
+*.keystore
+
+# 系统杂项
+Thumbs.db
+.DS_Store
+
+# 本地改动记录（用户规则：不提交 GitHub）
+CHANGELOG.MD

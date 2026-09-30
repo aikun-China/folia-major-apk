@@ -1,0 +1,48 @@
+// Folia 应用模块——WebView 混合壳，零 AndroidX 依赖
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.aikun.folia'
+    compileSdk 33
+    buildToolsVersion '33.0.2'
+
+    defaultConfig {
+        applicationId "com.aikun.folia"
+        minSdk 24
+        targetSdk 33
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    signingConfigs {
+        // 无独立 keystore 时复用 debug 签名（自用分发够用；正式上架需更换）
+        debug {
+            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            lint {
+                checkReleaseBuilds false
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+dependencies {
+    // 刻意保持零依赖：WebView / DownloadManager 均为系统 API
+}
