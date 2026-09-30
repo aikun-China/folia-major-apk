@@ -34,6 +34,7 @@ public class MainActivity extends Activity {
     private static final String HOME_URL = "https://music.aikun-bili.top";
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int REQ_NOTIFICATION = 1002;
+    private static final int REQ_FOLDER_PICKER = 1003;
 
     // Returns "closed" after simulating an Escape keydown when the page declares a
     // keyboard window ([data-folia-keyboard-window="true"]), otherwise "none".
@@ -55,6 +56,8 @@ public class MainActivity extends Activity {
     private boolean immersiveEnabled = false;
     // ③ audio/* 唤起：待消费的音频文件 Uri（onCreate 冷启动 / onNewIntent 热启动写入，桥一次性取走）。
     private Uri pendingAudioUri = null;
+    // ⑤ 文件夹导入：待消费的 SAF 目录 tree Uri（onActivityResult 写入，桥一次性取走）。
+    private Uri pendingFolderTreeUri = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,7 +74,7 @@ public class MainActivity extends Activity {
         }
 
         setupWebView();
-        // ④ 后台播放：前台服务（MediaSession/通知动作/音频焦点/耳机拔出）→ 网页播放器的命令回传通道。
+        // ④ 后台播放：前台服务（MediaSession/通知动作/耳机拔出）→ 网页播放器的命令回传通道。
         PlaybackService.setCommandSink(command -> runOnUiThread(() -> {
             if (webView == null) {
                 return;
@@ -274,6 +277,26 @@ public class MainActivity extends Activity {
                 fileUploadCallback.onReceiveValue(results);
                 fileUploadCallback = null;
             }
+        } else if (requestCode == REQ_FOLDER_PICKER) {
+            // ⑤ SAF 文件夹选择结果：记录 tree Uri 后通知页面开始消费；用户取消（RESULT_CANCELED）
+            // 也派发 cancel 事件，网页端据此结束等待、复位导入状态。
+            Uri treeUri = null;
+            if (resultCode == RESULT_OK && data != null) {
+                treeUri = data.getData();
+            }
+            if (treeUri != null) {
+                try {
+                    getContentResolver().takePersistableUriPermission(treeUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                } catch (SecurityException ignored) {
+                }
+                pendingFolderTreeUri = treeUri;
+            }
+            if (webView != null) {
+                webView.evaluateJavascript(
+                        "window.dispatchEvent(new CustomEvent('folia-android-folder-picked',{detail:'"
+                                + (treeUri != null ? "ok" : "cancel") + "'}));", null);
+            }
         } else {
             super.onActivityResult(requestCode, resultCode, data);
         }
@@ -303,6 +326,30 @@ public class MainActivity extends Activity {
     public Uri consumePendingAudioUri() {
         Uri uri = pendingAudioUri;
         pendingAudioUri = null;
+        return uri;
+    }
+
+    /** ⑤ 网页端桥入口：拉起系统文件夹选择器（SAF ACTION_OPEN_DOCUMENT_TREE）。 */
+    public void startFolderPicker() {
+        runOnUiThread(() -> {
+            try {
+                startActivityForResult(
+                        new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_FOLDER_PICKER);
+            } catch (Exception e) {
+                // 启动失败（无文件管理器等）也要补发 cancel，避免网页端等待悬挂。
+                if (webView != null) {
+                    webView.evaluateJavascript(
+                            "window.dispatchEvent(new CustomEvent('folia-android-folder-picked',{detail:'cancel'}));",
+                            null);
+                }
+            }
+        });
+    }
+
+    /** ⑤ 网页端桥入口：取走待消费的文件夹 tree Uri（一次性）。 */
+    public Uri consumePendingFolderTreeUri() {
+        Uri uri = pendingFolderTreeUri;
+        pendingFolderTreeUri = null;
         return uri;
     }
 

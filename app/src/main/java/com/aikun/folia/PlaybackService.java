@@ -10,8 +10,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
@@ -26,13 +24,15 @@ import org.json.JSONObject;
 /**
  * ④ 后台常驻播放：前台 Service，托着 MediaSession + 媒体通知卡片。
  *
- * 音频本体始终由 WebView 播放——本服务不碰音频流，职责只有三件：
+ * 音频本体始终由 WebView 播放——本服务不碰音频流，也绝不申请音频焦点：焦点由 WebView 内
+ * Chromium 媒体栈自持，服务侧若再申请会顶掉它，网页收 LOSS 立即自动暂停（"一点播放就停"）。
+ * 职责只有：
  * 1. 拉起前台优先级，避免退到后台后播放被系统休眠/杀进程；
  * 2. 提供通知栏/锁屏传输控制（MediaSession 回调 → 命令派发回网页播放器）；
- * 3. 请求音频焦点并监听耳机拔出，把系统事件翻译成 pause 命令。
+ * 3. 监听耳机拔出，把系统事件翻译成 pause 命令。
  *
  * 数据流：
- * - 网页端 --桥快照(桥线程写锁内)--> 本服务主线程 applySnapshotState（起停/焦点/通知）。
+ * - 网页端 --桥快照(桥线程写锁内)--> 本服务主线程 applySnapshotState（起停/通知）。
  * - 通知动作 --onStartCommand--> dispatchCommand；MediaSession 回调同样走 dispatchCommand。
  * - dispatchCommand --MainActivity 注入的 sink--> evaluateJavascript CustomEvent 回网页。
  */
@@ -102,16 +102,12 @@ public class PlaybackService extends Service {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private MediaSession mediaSession;
-    private AudioManager audioManager;
-    private AudioFocusRequest focusRequest26;
-    private boolean focusRequested = false;
     private BroadcastReceiver noisyReceiver = null;
 
     @Override
     public void onCreate() {
         super.onCreate();
         instance = this;
-        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         mediaSession = new MediaSession(this, "FoliaPlayback");
         mediaSession.setActive(true);
         mediaSession.setCallback(new MediaSession.Callback() {
@@ -178,7 +174,6 @@ public class PlaybackService extends Service {
         if (instance == this) {
             instance = null;
         }
-        abandonAudioFocus();
         unregisterNoisyReceiver();
         if (mediaSession != null) {
             mediaSession.setActive(false);
@@ -218,7 +213,6 @@ public class PlaybackService extends Service {
         if (!nextHasTrack) {
             // 无在播曲目：撤下通知并停止，进程回退普通优先级（WebView 若仍在播则交由系统裁量）。
             playing = false;
-            abandonAudioFocus();
             unregisterNoisyReceiver();
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -233,10 +227,8 @@ public class PlaybackService extends Service {
         positionSec = Math.max(0, nextPosition);
         if (playing != wasPlaying) {
             if (playing) {
-                requestAudioFocus();
                 registerNoisyReceiver();
             } else {
-                abandonAudioFocus();
                 unregisterNoisyReceiver();
             }
         }
@@ -321,54 +313,6 @@ public class PlaybackService extends Service {
         Intent intent = new Intent(this, PlaybackService.class).setAction(action);
         return PendingIntent.getService(this, requestCode, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-    }
-
-    private final AudioManager.OnAudioFocusChangeListener focusListener = focusChange -> {
-        if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-                || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-            // 被其他应用/系统抢占：让网页播放器暂停（DUCK 不打断，仅压低由系统处理）。
-            dispatchCommand("pause");
-        }
-    };
-
-    private void requestAudioFocus() {
-        if (focusRequested) {
-            return;
-        }
-        if (Build.VERSION.SDK_INT >= 26) {
-            if (focusRequest26 == null) {
-                focusRequest26 = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                .build())
-                        .setOnAudioFocusChangeListener(focusListener)
-                        .build();
-            }
-            focusRequested = audioManager.requestAudioFocus(focusRequest26)
-                    == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        } else {
-            focusRequested = audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
-                    AudioManager.AUDIOFOCUS_GAIN) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        }
-    }
-
-    private void abandonAudioFocus() {
-        if (!focusRequested) {
-            return;
-        }
-        focusRequested = false;
-        if (audioManager == null) {
-            return;
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= 26 && focusRequest26 != null) {
-                audioManager.abandonAudioFocusRequest(focusRequest26);
-            } else {
-                audioManager.abandonAudioFocus(focusListener);
-            }
-        } catch (Exception ignored) {
-        }
     }
 
     private void registerNoisyReceiver() {

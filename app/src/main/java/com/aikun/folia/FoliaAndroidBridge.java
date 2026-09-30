@@ -9,16 +9,21 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Base64;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * JS bridge injected into the WebView as window.foliaAndroid.
@@ -39,11 +44,36 @@ public class FoliaAndroidBridge {
     /** DownloadManager id of the in-flight/completed update APK, -1 when none. */
     private long updateDownloadId = -1;
 
-    /** ③ 音频唤起导入会话：单一 token 即可（导入天然串行），新 consume 会替换上一会话并关流。 */
+    /** ③ 音频唤起导入：固定 token 的单文件会话。 */
     private static final String AUDIO_IMPORT_TOKEN = "audio-intent";
-    private Uri audioImportUri = null;
-    private InputStream audioImportStream = null;
-    private long audioImportStreamOffset = -1;
+    /**
+     * ⑤ 分块读取会话表（token → 文件流缓存）：audio/* 唤起是单文件，SAF 文件夹导入一次登记多个
+     * 文件交替读取；LRU 上限控制同时打开的流数量，超出时关闭最老会话（按需重开 + skip 恢复）。
+     */
+    private static final int MAX_IMPORT_SESSIONS = 3;
+    private int folderSessionSeq = 0;
+    private final Map<String, ImportSession> importSessions =
+            new LinkedHashMap<String, ImportSession>() {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ImportSession> eldest) {
+                    if (size() > MAX_IMPORT_SESSIONS) {
+                        closeStream(eldest.getValue());
+                        return true;
+                    }
+                    return false;
+                }
+            };
+
+    /** 单个待读文件的流缓存：顺序读优化（乱序才重开流 skip 到位）。 */
+    private static final class ImportSession {
+        final Uri uri;
+        InputStream stream;
+        long streamOffset = -1;
+
+        ImportSession(Uri uri) {
+            this.uri = uri;
+        }
+    }
 
     public FoliaAndroidBridge(Activity activity) {
         this.activity = activity;
@@ -201,8 +231,6 @@ public class FoliaAndroidBridge {
     /** ③ 消费待处理的音频唤起 intent，返回 {token,name,size,mimeType} JSON；无待处理时返回 null。 */
     @JavascriptInterface
     public String consumePendingAudioIntent() {
-        closeAudioImportStream();
-        audioImportUri = null;
         if (!(activity instanceof MainActivity)) {
             return null;
         }
@@ -211,62 +239,76 @@ public class FoliaAndroidBridge {
             return null;
         }
         try {
+            registerImportSession(uri, AUDIO_IMPORT_TOKEN);
             JSONObject info = new JSONObject();
             info.put("token", AUDIO_IMPORT_TOKEN);
             info.put("name", resolveAudioDisplayName(uri));
             info.put("size", resolveAudioSize(uri));
             String mime = activity.getContentResolver().getType(uri);
             info.put("mimeType", mime == null ? "" : mime);
-            audioImportUri = uri;
             return info.toString();
         } catch (Exception e) {
-            audioImportUri = null;
             return null;
         }
     }
 
-    /** ③ 分块读取唤起的音频，返回该区间 Base64（NO_WRAP）；流结束/失败/越界返回空串。 */
+    /** ③/⑤ 分块读取会话文件，返回该区间 Base64（NO_WRAP）；流结束/失败/越界返回空串。 */
     @JavascriptInterface
     public String readAudioChunk(String token, long offset, int length) {
-        if (audioImportUri == null || !AUDIO_IMPORT_TOKEN.equals(token) || offset < 0 || length <= 0) {
+        if (token == null || token.length() == 0 || offset < 0 || length <= 0) {
+            return "";
+        }
+        ImportSession session = importSessions.get(token);
+        if (session == null) {
             return "";
         }
         try {
             // 缓存流顺序读：网页端按 offset 递增请求；乱序/新会话才重开流并 skip 到位，
             // 避免每块重开造成大文件 O(n²) I/O。
-            if (audioImportStream == null || audioImportStreamOffset != offset) {
-                closeAudioImportStream();
-                InputStream stream = activity.getContentResolver().openInputStream(audioImportUri);
+            if (session.stream == null || session.streamOffset != offset) {
+                closeStream(session);
+                InputStream stream = activity.getContentResolver().openInputStream(session.uri);
                 if (stream == null) {
                     return "";
                 }
                 skipFully(stream, offset);
-                audioImportStream = stream;
-                audioImportStreamOffset = offset;
+                session.stream = stream;
+                session.streamOffset = offset;
             }
             int cap = Math.min(length, 4 * 1024 * 1024);
             byte[] buffer = new byte[cap];
-            int read = audioImportStream.read(buffer);
+            int read = session.stream.read(buffer);
             if (read <= 0) {
-                closeAudioImportStream();
+                closeStream(session);
                 return "";
             }
-            audioImportStreamOffset = offset + read;
+            session.streamOffset = offset + read;
             return Base64.encodeToString(buffer, 0, read, Base64.NO_WRAP);
         } catch (Exception e) {
-            closeAudioImportStream();
+            closeStream(session);
             return "";
         }
     }
 
-    private void closeAudioImportStream() {
-        if (audioImportStream != null) {
+    /** 登记一个待读会话；同 token 重复登记先关旧流（新会话替换旧会话）。 */
+    private ImportSession registerImportSession(Uri uri, String token) {
+        ImportSession existing = importSessions.remove(token);
+        if (existing != null) {
+            closeStream(existing);
+        }
+        ImportSession session = new ImportSession(uri);
+        importSessions.put(token, session);
+        return session;
+    }
+
+    private static void closeStream(ImportSession session) {
+        if (session.stream != null) {
             try {
-                audioImportStream.close();
+                session.stream.close();
             } catch (Exception ignored) {
             }
-            audioImportStream = null;
-            audioImportStreamOffset = -1;
+            session.stream = null;
+            session.streamOffset = -1;
         }
     }
 
@@ -281,6 +323,129 @@ public class FoliaAndroidBridge {
             } else {
                 remaining--;
             }
+        }
+    }
+
+    /** ⑤ 请求用户选择音乐文件夹（SAF ACTION_OPEN_DOCUMENT_TREE）；选择结果经事件回调。 */
+    @JavascriptInterface
+    public boolean pickAudioFolder() {
+        if (activity instanceof MainActivity) {
+            ((MainActivity) activity).startFolderPicker();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * ⑤ 列出待导入文件夹内的候选文件（消费 tree Uri，一次性）。
+     * SAF 目录树按层枚举代价高，v1 只枚举所选目录一层；按扩展名过滤出音频/歌词/封面
+     * （与网页端 getSnapshotFileKind 的白名单对齐），返回
+     * [{token,name,size,mimeType,relativePath}] JSON，relativePath 首段为所选文件夹名。
+     * 未选择/失败返回 null，无候选返回 "[]"。
+     */
+    @JavascriptInterface
+    public String listAudioFolderEntries() {
+        if (!(activity instanceof MainActivity)) {
+            return null;
+        }
+        Uri treeUri = ((MainActivity) activity).consumePendingFolderTreeUri();
+        if (treeUri == null) {
+            return null;
+        }
+        Cursor cursor = null;
+        try {
+            String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
+            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootDocId);
+            String rootName = resolveTreeDisplayName(treeUri, rootDocId);
+            JSONArray entries = new JSONArray();
+            cursor = activity.getContentResolver().query(childrenUri, null, null, null, null);
+            while (cursor != null && cursor.moveToNext()) {
+                String name = safeColumn(cursor, DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+                String mime = safeColumn(cursor, DocumentsContract.Document.COLUMN_MIME_TYPE);
+                if (name == null || mime == null
+                        || DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)
+                        || !isImportableFileName(name)) {
+                    continue;
+                }
+                String docId = safeColumn(cursor, DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+                if (docId == null) {
+                    continue;
+                }
+                int sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE);
+                long size = sizeIndex >= 0 && !cursor.isNull(sizeIndex) ? cursor.getLong(sizeIndex) : -1;
+                String token = "folder-" + (++folderSessionSeq);
+                registerImportSession(DocumentsContract.buildDocumentUriUsingTree(treeUri, docId), token);
+                JSONObject entry = new JSONObject();
+                entry.put("token", token);
+                entry.put("name", name);
+                entry.put("size", size);
+                entry.put("mimeType", mime);
+                entry.put("relativePath", rootName + "/" + name);
+                entries.put(entry);
+            }
+            return entries.length() == 0 ? "[]" : entries.toString();
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+    }
+
+    /** 查询所选目录的显示名，兜底从 tree document id（"primary:Music/Folia"）取路径末段。 */
+    private String resolveTreeDisplayName(Uri treeUri, String rootDocId) {
+        Cursor cursor = null;
+        try {
+            cursor = activity.getContentResolver().query(treeUri,
+                    new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+                if (index >= 0 && cursor.getString(index) != null && cursor.getString(index).length() > 0) {
+                    return cursor.getString(index);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        int colon = rootDocId.indexOf(':');
+        String path = colon >= 0 ? rootDocId.substring(colon + 1) : rootDocId;
+        int slash = path.lastIndexOf('/');
+        String name = slash >= 0 ? path.substring(slash + 1) : path;
+        return name.length() == 0 ? "Music" : name;
+    }
+
+    private static String safeColumn(Cursor cursor, String column) {
+        int index = cursor.getColumnIndex(column);
+        return index >= 0 ? cursor.getString(index) : null;
+    }
+
+    /** 扩展名白名单对齐网页端 getSnapshotFileKind：音频/歌词（翻译歌词扩展名重合自动覆盖）/封面。 */
+    private static boolean isImportableFileName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        int dot = lower.lastIndexOf('.');
+        String extension = dot >= 0 ? lower.substring(dot + 1) : "";
+        switch (extension) {
+            case "mp3":
+            case "flac":
+            case "m4a":
+            case "wav":
+            case "ogg":
+            case "opus":
+            case "aac":
+            case "lrc":
+            case "vtt":
+            case "ttml":
+            case "qrc":
+            case "yrc":
+            case "krc":
+            case "fia":
+                return true;
+            default:
+                return lower.equals("cover.png") || lower.equals("cover.jpg") || lower.equals("cover.jpeg");
         }
     }
 
