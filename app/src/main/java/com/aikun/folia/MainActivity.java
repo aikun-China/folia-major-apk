@@ -31,6 +31,16 @@ public class MainActivity extends Activity {
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int REQ_NOTIFICATION = 1002;
 
+    // Returns "closed" after simulating an Escape keydown when the page declares a
+    // keyboard window ([data-folia-keyboard-window="true"]), otherwise "none".
+    // Dispatched on document so both document-level and window-level handlers receive it.
+    private static final String CLOSE_OVERLAY_OR_NONE_SCRIPT =
+            "(function(){try{"
+                    + "if(!document.querySelector('[data-folia-keyboard-window=\"true\"]')){return 'none';}"
+                    + "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true}));"
+                    + "return 'closed';"
+                    + "}catch(e){return 'none';}})()";
+
     private WebView webView;
     private FrameLayout rootLayout;
     private Chrome chromeClient;
@@ -224,11 +234,30 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (customView != null) {
             chromeClient.onHideCustomView();
-        } else if (webView.canGoBack()) {
-            webView.goBack();
-        } else {
-            super.onBackPressed();
+            return;
         }
+        if (webView == null) {
+            super.onBackPressed();
+            return;
+        }
+        // Let the page close its topmost overlay first; only fall back to history
+        // navigation or exiting when the page reports nothing was open.
+        webView.evaluateJavascript(CLOSE_OVERLAY_OR_NONE_SCRIPT, new ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String value) {
+                if (value != null && value.contains("closed")) {
+                    return;
+                }
+                if (webView == null) {
+                    return;
+                }
+                if (webView.canGoBack()) {
+                    webView.goBack();
+                } else {
+                    MainActivity.super.onBackPressed();
+                }
+            }
+        });
     }
 
     @Override
