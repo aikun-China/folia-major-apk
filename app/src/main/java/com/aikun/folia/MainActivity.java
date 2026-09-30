@@ -3,6 +3,7 @@ package com.aikun.folia;
 import android.Manifest;
 import android.app.Activity;
 import android.app.DownloadManager;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
@@ -83,7 +84,12 @@ public class MainActivity extends Activity {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
         }
         if (savedInstanceState != null) {
+            // 进程恢复：先还原沉浸式标志（onWindowFocusChanged 依赖它重放），再恢复页面。
+            immersiveEnabled = savedInstanceState.getBoolean("immersive", false);
             webView.restoreState(savedInstanceState);
+            if (immersiveEnabled) {
+                applyImmersiveMode();
+            }
         } else {
             webView.loadUrl(HOME_URL);
         }
@@ -143,6 +149,11 @@ public class MainActivity extends Activity {
             if (url != null && url.startsWith("http")) {
                 CookieManager.getInstance().flush();
             }
+            // 页面（含进程恢复后 restoreState 的重载）就绪：通知网页端回放沉浸式期望值。
+            // 期望值存在网页 localStorage 里，原生 immersiveEnabled 标志恢复初期恒 false，
+            // 只能由网页端回放告知。
+            view.evaluateJavascript(
+                    "window.dispatchEvent(new CustomEvent('folia-android-page-ready'));", null);
         }
     }
 
@@ -245,8 +256,19 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQ_FILE_CHOOSER) {
             Uri[] results = null;
-            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
-                results = new Uri[]{data.getData()};
+            if (resultCode == RESULT_OK && data != null) {
+                // 网页端 multiple 输入的多选结果在 ClipData 里，data.getData() 此时为 null；
+                // 丢掉 ClipData 会让网页收到空列表，表现为"选完文件毫无反应"。
+                ClipData clip = data.getClipData();
+                if (clip != null) {
+                    int count = clip.getItemCount();
+                    results = new Uri[count];
+                    for (int i = 0; i < count; i++) {
+                        results[i] = clip.getItemAt(i).getUri();
+                    }
+                } else if (data.getData() != null) {
+                    results = new Uri[]{data.getData()};
+                }
             }
             if (fileUploadCallback != null) {
                 fileUploadCallback.onReceiveValue(results);
@@ -366,6 +388,7 @@ public class MainActivity extends Activity {
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         webView.saveState(outState);
+        outState.putBoolean("immersive", immersiveEnabled);
     }
 
     @Override
