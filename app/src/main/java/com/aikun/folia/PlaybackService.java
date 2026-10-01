@@ -55,7 +55,7 @@ public class PlaybackService extends Service {
     private static final String CHANNEL_ID = "folia_playback";
     private static final int NOTIFICATION_ID = 42;
 
-    /** 服务把 play/pause/prev/next 命令推回网页播放器的回调面（MainActivity 注册，Activity 销毁时清空）。 */
+    /** 服务把 play/pause/prev/next/seek 命令推回网页播放器的回调面（MainActivity 注册，Activity 销毁时清空）。 */
     public interface MediaCommandSink {
         void onMediaCommand(String command);
     }
@@ -79,6 +79,20 @@ public class PlaybackService extends Service {
         try {
             JSONObject o = new JSONObject();
             o.put("command", command);
+            dispatchJson(o.toString());
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 进度拖动：流体云/控制中心的进度条（ACTION_SEEK_TO）。MediaSession 回调给的是毫秒，
+     * 快照契约用秒，这里换算后交网页端走与页内进度条同一的 seek 通道。
+     */
+    static void dispatchSeek(long positionSec) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("command", "seek");
+            o.put("positionSec", Math.max(0, positionSec));
             dispatchJson(o.toString());
         } catch (Exception ignored) {
         }
@@ -172,6 +186,11 @@ public class PlaybackService extends Service {
             @Override
             public void onSkipToNext() {
                 dispatchCommand("next");
+            }
+
+            @Override
+            public void onSeekTo(long pos) {
+                dispatchSeek(pos / 1000);
             }
 
             @Override
@@ -317,10 +336,13 @@ public class PlaybackService extends Service {
         }
         mediaSession.setMetadata(metadataBuilder.build());
         long positionMs = positionSec * 1000;
+        // ACTION_SEEK_TO 声明后流体云/控制中心才会显示可拖动进度条并派发 onSeekTo；
+        // 位置与速度（1f/0f）随每次快照刷新，拖动基准由系统按速度外推。
         PlaybackState.Builder state = new PlaybackState.Builder()
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
                         | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_NEXT
                         | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                        | PlaybackState.ACTION_SEEK_TO
                         | PlaybackState.ACTION_PLAY_FROM_SEARCH);
         if (playing) {
             state.setState(PlaybackState.STATE_PLAYING, positionMs, 1f);

@@ -79,13 +79,15 @@ public class MainActivity extends Activity {
         setupWebView();
         // ④ 后台播放：前台服务（MediaSession/通知动作/耳机拔出/语音搜索）→ 网页播放器的命令
         // 回传通道。payload 是 JSON 文本；quote 生成安全的 JS 字符串字面量，页面侧 JSON.parse。
+        // 切勿在表达式里先行 JSON.parse：页面侧会对 detail 再 parse 一次，双 parse 会把
+        // 对象 coerce 成 "[object Object]" 抛错，整条命令链（播放/暂停/切歌/进度）静默失灵。
         PlaybackService.setCommandSink(payload -> runOnUiThread(() -> {
             if (webView == null) {
                 return;
             }
             webView.evaluateJavascript(
-                    "window.dispatchEvent(new CustomEvent('folia-android-media-command',{detail:JSON.parse("
-                            + JSONObject.quote(payload) + ")}));", null);
+                    "window.dispatchEvent(new CustomEvent('folia-android-media-command',{detail:"
+                            + JSONObject.quote(payload) + "}));", null);
         }));
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
