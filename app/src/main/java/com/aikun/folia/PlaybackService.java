@@ -17,9 +17,11 @@ import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.provider.MediaStore;
 
 import org.json.JSONObject;
 
@@ -69,10 +71,37 @@ public class PlaybackService extends Service {
         commandSink = sink;
     }
 
+    /**
+     * 命令派发：sink 收到的是 JSON 文本（{"command":"play"} 等）。网页端 JSON.parse 后按
+     * command 字段路由；JSON 转义保证语音 query 里的引号/反斜杠不会拼坏派发表达式。
+     */
     static void dispatchCommand(String command) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("command", command);
+            dispatchJson(o.toString());
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 语音搜索派发：{"command":"search","query":"...","focus":"vnd.android.cursor.item/audio"}。 */
+    static void dispatchSearch(String query, String focus) {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("command", "search");
+            o.put("query", query);
+            if (focus != null && focus.length() > 0) {
+                o.put("focus", focus);
+            }
+            dispatchJson(o.toString());
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void dispatchJson(String json) {
         MediaCommandSink sink = commandSink;
         if (sink != null) {
-            sink.onMediaCommand(command);
+            sink.onMediaCommand(json);
         }
     }
 
@@ -143,6 +172,18 @@ public class PlaybackService extends Service {
             @Override
             public void onSkipToNext() {
                 dispatchCommand("next");
+            }
+
+            @Override
+            public void onPlayFromSearch(String query, Bundle extras) {
+                // 语音助手（Google 助手/小艺等）："播放 xxx" 走这里。空 query（只喊了"播放"）
+                // 退化为恢复播放；否则把搜索词交给网页端执行"搜索第一首并播放"。
+                if (query == null || query.trim().length() == 0) {
+                    dispatchCommand("play");
+                    return;
+                }
+                String focus = extras == null ? null : extras.getString(MediaStore.EXTRA_MEDIA_FOCUS);
+                dispatchSearch(query.trim(), focus);
             }
         });
         if (Build.VERSION.SDK_INT >= 26) {
@@ -279,7 +320,8 @@ public class PlaybackService extends Service {
         PlaybackState.Builder state = new PlaybackState.Builder()
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
                         | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SKIP_TO_NEXT
-                        | PlaybackState.ACTION_SKIP_TO_PREVIOUS);
+                        | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                        | PlaybackState.ACTION_PLAY_FROM_SEARCH);
         if (playing) {
             state.setState(PlaybackState.STATE_PLAYING, positionMs, 1f);
         } else {

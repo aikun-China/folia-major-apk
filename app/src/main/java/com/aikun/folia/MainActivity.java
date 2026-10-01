@@ -6,6 +6,7 @@ import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -28,6 +29,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
+
+import org.json.JSONObject;
 
 public class MainActivity extends Activity {
 
@@ -74,14 +77,15 @@ public class MainActivity extends Activity {
         }
 
         setupWebView();
-        // ④ 后台播放：前台服务（MediaSession/通知动作/耳机拔出）→ 网页播放器的命令回传通道。
-        PlaybackService.setCommandSink(command -> runOnUiThread(() -> {
+        // ④ 后台播放：前台服务（MediaSession/通知动作/耳机拔出/语音搜索）→ 网页播放器的命令
+        // 回传通道。payload 是 JSON 文本；quote 生成安全的 JS 字符串字面量，页面侧 JSON.parse。
+        PlaybackService.setCommandSink(payload -> runOnUiThread(() -> {
             if (webView == null) {
                 return;
             }
             webView.evaluateJavascript(
-                    "window.dispatchEvent(new CustomEvent('folia-android-media-command',{detail:'"
-                            + command + "'}));", null);
+                    "window.dispatchEvent(new CustomEvent('folia-android-media-command',{detail:JSON.parse("
+                            + JSONObject.quote(payload) + ")}));", null);
         }));
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
@@ -364,6 +368,24 @@ public class MainActivity extends Activity {
 
     private void applyImmersiveMode() {
         Window window = getWindow();
+        // 打孔屏/刘海屏：沉浸时窗口必须延伸进挖孔区域（SHORT_EDGES），否则系统把状态栏区域
+        // letterbox 成一条黑边——最近任务快照同样带黑边。非沉浸时恢复默认避让。
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams lp = window.getAttributes();
+            lp.layoutInDisplayCutoutMode = immersiveEnabled
+                    ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+            window.setAttributes(lp);
+        }
+        // 沉浸时系统栏底色透明：下滑瞬变呼出（BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE）不闪
+        // 主题色底块；退出沉浸时还原主题色（getColor 随 values/values-night 自动切换）。
+        if (immersiveEnabled) {
+            window.setStatusBarColor(Color.TRANSPARENT);
+            window.setNavigationBarColor(Color.TRANSPARENT);
+        } else {
+            window.setStatusBarColor(getColor(R.color.status_bar));
+            window.setNavigationBarColor(getColor(R.color.nav_bar));
+        }
         if (Build.VERSION.SDK_INT >= 30) {
             WindowInsetsController controller = window.getInsetsController();
             if (controller == null) {
