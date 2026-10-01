@@ -21,6 +21,7 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -47,18 +48,18 @@ public class FoliaAndroidBridge {
     /** ③ 音频唤起导入：固定 token 的单文件会话。 */
     private static final String AUDIO_IMPORT_TOKEN = "audio-intent";
     /**
-     * ⑤ 分块读取会话表（token → 文件流缓存）：audio/* 唤起是单文件，SAF 文件夹导入一次登记多个
-     * 文件交替读取；LRU 上限控制同时打开的流数量，超出时关闭最老会话（按需重开 + skip 恢复）。
+     * ⑤ 分块读取会话表（token → 文件流缓存）：audio/* 唤起是单文件，SAF 文件夹导入一次登记
+     * 大量文件交替读取。条目常驻（保证已登记 token 始终可读），仅用访问序 LRU 控制「同时打开
+     * 的流」数量：超限时只关闭最久未访问会话的流，下次读取按 streamOffset 自动重开 + skip 恢复。
      */
-    private static final int MAX_IMPORT_SESSIONS = 3;
+    private static final int MAX_OPEN_IMPORT_STREAMS = 3;
     private int folderSessionSeq = 0;
     private final Map<String, ImportSession> importSessions =
-            new LinkedHashMap<String, ImportSession>() {
+            new LinkedHashMap<String, ImportSession>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, ImportSession> eldest) {
-                    if (size() > MAX_IMPORT_SESSIONS) {
+                    if (size() > MAX_OPEN_IMPORT_STREAMS) {
                         closeStream(eldest.getValue());
-                        return true;
                     }
                     return false;
                 }
@@ -338,10 +339,11 @@ public class FoliaAndroidBridge {
 
     /**
      * ⑤ 列出待导入文件夹内的候选文件（消费 tree Uri，一次性）。
-     * SAF 目录树按层枚举代价高，v1 只枚举所选目录一层；按扩展名过滤出音频/歌词/封面
+     * 深度优先递归枚举整个目录树（含子文件夹），按扩展名过滤出音频/歌词/封面
      * （与网页端 getSnapshotFileKind 的白名单对齐），返回
      * [{token,name,size,mimeType,relativePath}] JSON，relativePath 首段为所选文件夹名。
-     * 未选择/失败返回 null，无候选返回 "[]"。
+     * 深度上限 MAX_IMPORT_SCAN_DEPTH、文件数上限 MAX_IMPORT_SCAN_FILES，防止超大目录树
+     * 拖垮桥线程。未选择/失败返回 null，无候选返回 "[]"。
      */
     @JavascriptInterface
     public String listAudioFolderEntries() {
@@ -352,23 +354,48 @@ public class FoliaAndroidBridge {
         if (treeUri == null) {
             return null;
         }
-        Cursor cursor = null;
+        clearFolderImportSessions();
         try {
             String rootDocId = DocumentsContract.getTreeDocumentId(treeUri);
-            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootDocId);
             String rootName = resolveTreeDisplayName(treeUri, rootDocId);
             JSONArray entries = new JSONArray();
+            collectFolderEntries(treeUri, rootDocId, rootName, 0, entries);
+            return entries.length() == 0 ? "[]" : entries.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static final int MAX_IMPORT_SCAN_DEPTH = 6;
+    private static final int MAX_IMPORT_SCAN_FILES = 500;
+
+    private void collectFolderEntries(Uri treeUri, String parentDocId, String parentPath,
+            int depth, JSONArray out) {
+        if (depth > MAX_IMPORT_SCAN_DEPTH || out.length() >= MAX_IMPORT_SCAN_FILES) {
+            return;
+        }
+        Cursor cursor = null;
+        try {
+            Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId);
             cursor = activity.getContentResolver().query(childrenUri, null, null, null, null);
             while (cursor != null && cursor.moveToNext()) {
+                if (out.length() >= MAX_IMPORT_SCAN_FILES) {
+                    break;
+                }
                 String name = safeColumn(cursor, DocumentsContract.Document.COLUMN_DISPLAY_NAME);
                 String mime = safeColumn(cursor, DocumentsContract.Document.COLUMN_MIME_TYPE);
-                if (name == null || mime == null
-                        || DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)
-                        || !isImportableFileName(name)) {
+                if (name == null || mime == null) {
                     continue;
                 }
                 String docId = safeColumn(cursor, DocumentsContract.Document.COLUMN_DOCUMENT_ID);
                 if (docId == null) {
+                    continue;
+                }
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                    collectFolderEntries(treeUri, docId, parentPath + "/" + name, depth + 1, out);
+                    continue;
+                }
+                if (!isImportableFileName(name)) {
                     continue;
                 }
                 int sizeIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE);
@@ -380,15 +407,25 @@ public class FoliaAndroidBridge {
                 entry.put("name", name);
                 entry.put("size", size);
                 entry.put("mimeType", mime);
-                entry.put("relativePath", rootName + "/" + name);
-                entries.put(entry);
+                entry.put("relativePath", parentPath + "/" + name);
+                out.put(entry);
             }
-            return entries.length() == 0 ? "[]" : entries.toString();
-        } catch (Exception e) {
-            return null;
+        } catch (Exception ignored) {
         } finally {
             if (cursor != null) {
                 cursor.close();
+            }
+        }
+    }
+
+    /** 关闭并清空上一轮文件夹枚举登记的会话（token 以 "folder-" 开头），防止会话表无界增长。 */
+    private void clearFolderImportSessions() {
+        Iterator<Map.Entry<String, ImportSession>> iterator = importSessions.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, ImportSession> entry = iterator.next();
+            if (entry.getKey().startsWith("folder-")) {
+                closeStream(entry.getValue());
+                iterator.remove();
             }
         }
     }

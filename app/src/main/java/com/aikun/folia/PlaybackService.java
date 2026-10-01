@@ -10,6 +10,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
@@ -20,6 +22,11 @@ import android.os.IBinder;
 import android.os.Looper;
 
 import org.json.JSONObject;
+
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * ④ 后台常驻播放：前台 Service，托着 MediaSession + 媒体通知卡片。
@@ -99,8 +106,15 @@ public class PlaybackService extends Service {
     private String album = "";
     private long durationSec = 0;
     private long positionSec = 0;
+    private String artworkUrl = "";
+    private String currentLyricLine = "";
+
+    /** 已加载/加载中的封面 URL（去重，失败不自动重试）；null = 从未加载。 */
+    private String loadedArtworkUrl = null;
+    private Bitmap artworkBitmap = null;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
     private MediaSession mediaSession;
     private BroadcastReceiver noisyReceiver = null;
 
@@ -174,6 +188,8 @@ public class PlaybackService extends Service {
         if (instance == this) {
             instance = null;
         }
+        artworkExecutor.shutdownNow();
+        artworkBitmap = null;
         unregisterNoisyReceiver();
         if (mediaSession != null) {
             mediaSession.setActive(false);
@@ -199,6 +215,8 @@ public class PlaybackService extends Service {
         String nextAlbum = "";
         long nextDuration = 0;
         long nextPosition = 0;
+        String nextArtworkUrl = "";
+        String nextLyricLine = "";
         try {
             JSONObject o = new JSONObject(json == null ? "{}" : json);
             nextHasTrack = o.optBoolean("hasTrack", false);
@@ -208,6 +226,8 @@ public class PlaybackService extends Service {
             nextAlbum = o.optString("album", "");
             nextDuration = o.optLong("durationSec", 0);
             nextPosition = o.optLong("positionSec", 0);
+            nextArtworkUrl = o.optString("artworkUrl", "");
+            nextLyricLine = o.optString("currentLyricLine", "");
         } catch (Exception ignored) {
         }
         if (!nextHasTrack) {
@@ -225,6 +245,9 @@ public class PlaybackService extends Service {
         album = nextAlbum;
         durationSec = Math.max(0, nextDuration);
         positionSec = Math.max(0, nextPosition);
+        artworkUrl = nextArtworkUrl;
+        currentLyricLine = nextLyricLine;
+        loadArtworkIfNeeded();
         if (playing != wasPlaying) {
             if (playing) {
                 registerNoisyReceiver();
@@ -240,14 +263,18 @@ public class PlaybackService extends Service {
         if (mediaSession == null) {
             return;
         }
-        MediaMetadata metadata = new MediaMetadata.Builder()
+        // 播放中把"艺术家"一行换成实时歌词（流体云/控制中心媒体卡片直接读 MediaSession metadata）。
+        boolean showLyric = playing && currentLyricLine != null && currentLyricLine.length() > 0;
+        MediaMetadata.Builder metadataBuilder = new MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE,
                         title == null || title.length() == 0 ? "Folia" : title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, showLyric ? currentLyricLine : artist)
                 .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, durationSec * 1000)
-                .build();
-        mediaSession.setMetadata(metadata);
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, durationSec * 1000);
+        if (artworkBitmap != null && !artworkBitmap.isRecycled()) {
+            metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, artworkBitmap);
+        }
+        mediaSession.setMetadata(metadataBuilder.build());
         long positionMs = positionSec * 1000;
         PlaybackState.Builder state = new PlaybackState.Builder()
                 .setActions(PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
@@ -259,6 +286,49 @@ public class PlaybackService extends Service {
             state.setState(PlaybackState.STATE_PAUSED, positionMs, 0f);
         }
         mediaSession.setPlaybackState(state.build());
+    }
+
+    /** 封面按 URL 变化才重新拉取解码：空 URL 清空旧封面；失败不自动重试（换曲/封面变化时自然再试）。 */
+    private void loadArtworkIfNeeded() {
+        String url = artworkUrl == null ? "" : artworkUrl;
+        if (url.length() == 0) {
+            if (loadedArtworkUrl != null && loadedArtworkUrl.length() > 0) {
+                loadedArtworkUrl = "";
+                artworkBitmap = null;
+                updateMediaSession();
+                startForegroundWithNotification();
+            }
+            return;
+        }
+        if (url.equals(loadedArtworkUrl)) {
+            return;
+        }
+        loadedArtworkUrl = url;
+        artworkExecutor.execute(() -> {
+            Bitmap bitmap = null;
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new URL(url).openConnection();
+                connection.setConnectTimeout(8000);
+                connection.setReadTimeout(8000);
+                connection.setInstanceFollowRedirects(true);
+                bitmap = BitmapFactory.decodeStream(connection.getInputStream());
+            } catch (Exception ignored) {
+            } finally {
+                if (connection != null) {
+                    connection.disconnect();
+                }
+            }
+            final Bitmap loaded = bitmap;
+            mainHandler.post(() -> {
+                if (instance != this) {
+                    return;
+                }
+                artworkBitmap = loaded;
+                updateMediaSession();
+                startForegroundWithNotification();
+            });
+        });
     }
 
     private void startForegroundWithNotification() {
@@ -285,9 +355,13 @@ public class PlaybackService extends Service {
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
+        boolean showLyric = playing && currentLyricLine != null && currentLyricLine.length() > 0;
+        String contentText = showLyric ? currentLyricLine
+                : (playing ? artist
+                : (artist == null || artist.length() == 0 ? "已暂停" : artist + " · 已暂停"));
         builder.setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title == null || title.length() == 0 ? "Folia" : title)
-                .setContentText(playing ? artist : (artist == null || artist.length() == 0 ? "已暂停" : artist + " · 已暂停"))
+                .setContentText(contentText)
                 .setContentIntent(contentPi)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
@@ -299,6 +373,10 @@ public class PlaybackService extends Service {
                         playPauseIcon, playPauseLabel, actionPi(playing ? ACTION_PAUSE : ACTION_PLAY, 2)).build())
                 .addAction(new Notification.Action.Builder(
                         android.R.drawable.ic_media_next, "下一首", actionPi(ACTION_NEXT, 3)).build());
+
+        if (artworkBitmap != null && !artworkBitmap.isRecycled()) {
+            builder.setLargeIcon(artworkBitmap);
+        }
 
         Notification.MediaStyle style = new Notification.MediaStyle();
         if (mediaSession != null) {

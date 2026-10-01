@@ -12,8 +12,8 @@ android {
         applicationId "com.aikun.folia"
         minSdk 24
         targetSdk 33
-        versionCode 5
-        versionName "0.9.2"
+        versionCode 6
+        versionName "0.9.3"
     }
 
     signingConfigs {
