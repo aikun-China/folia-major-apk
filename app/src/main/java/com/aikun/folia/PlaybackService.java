@@ -52,7 +52,13 @@ public class PlaybackService extends Service {
     public static final String ACTION_PREVIOUS = "com.aikun.folia.action.PREVIOUS";
     public static final String ACTION_NEXT = "com.aikun.folia.action.NEXT";
 
-    private static final String CHANNEL_ID = "folia_playback";
+    /**
+     * 锁屏稳显渠道：IMPORTANCE_DEFAULT（无声）。IMPORTANCE_LOW 虽符合原生规范，但多数国产 ROM
+     * 会把低重要性通知从锁屏折叠甚至隐去、状态栏不出图标——锁屏媒体卡片因此时有时无。
+     * 渠道重要性创建后不可改，老用户迁移只能换渠道 ID；旧渠道删除避免设置页残留双条目。
+     */
+    private static final String CHANNEL_ID = "folia_playback_v2";
+    private static final String LEGACY_CHANNEL_ID = "folia_playback";
     private static final int NOTIFICATION_ID = 42;
 
     /** 服务把 play/pause/prev/next/seek 命令推回网页播放器的回调面（MainActivity 注册，Activity 销毁时清空）。 */
@@ -208,10 +214,14 @@ public class PlaybackService extends Service {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Folia 播放",
-                    NotificationManager.IMPORTANCE_LOW);
+                    NotificationManager.IMPORTANCE_DEFAULT);
             channel.setDescription("后台播放控制");
             channel.setShowBadge(false);
+            // 不设声音（显式置 null）：DEFAULT 只带来横幅+状态栏图标，配合 setOnlyAlertOnce
+            // 仅通知首次出现时出横幅，之后的播放/暂停/切歌更新全部静默。
+            channel.setSound(null, null);
             nm.createNotificationChannel(channel);
+            nm.deleteNotificationChannel(LEGACY_CHANNEL_ID);
         }
         applySnapshotState();
     }
@@ -424,6 +434,8 @@ public class PlaybackService extends Service {
                 : (playing ? artist
                 : (artist == null || artist.length() == 0 ? "已暂停" : artist + " · 已暂停"));
         builder.setSmallIcon(R.mipmap.ic_launcher)
+                // 媒体传输类别：ROM 据此把本通知识别为媒体卡片，参与锁屏媒体控件的排序与样式判定。
+                .setCategory(Notification.CATEGORY_TRANSPORT)
                 .setContentTitle(title == null || title.length() == 0 ? "Folia" : title)
                 .setContentText(contentText)
                 .setContentIntent(contentPi)

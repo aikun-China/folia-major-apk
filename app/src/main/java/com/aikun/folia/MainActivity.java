@@ -6,6 +6,7 @@ import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -422,6 +423,21 @@ public class MainActivity extends Activity {
         // 软键盘、系统对话框等会清掉 systemUiVisibility；重新聚焦时补放一次。
         if (hasFocus && immersiveEnabled) {
             applyImmersiveMode();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Android 13+ 通知权限决定媒体通知（含锁屏媒体卡片）能否出现；onCreate 只请求一次，
+        // 用户误拒后就永远没有锁屏显示了。这里对「拒绝过一次但未永久拒绝」补发一次请求：
+        // 连续两次拒绝后系统标记永久拒绝，shouldShowRequestPermissionRationale 变 false，
+        // 不再弹窗骚扰；已授权则直接短路。
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED
+                && shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIFICATION);
         }
     }
 
